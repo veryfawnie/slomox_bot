@@ -124,6 +124,9 @@ def _run(cmd, timeout=600):
     if cmd and cmd[0] in ("ffmpeg", "ffmpeg.exe"):
         cmd.insert(1, "-loglevel")
         cmd.insert(2, "error")
+        # Limit filter graph threads to control peak RAM on small containers
+        cmd.insert(3, "-filter_threads")
+        cmd.insert(4, "1")
 
     logger.info(f"FFmpeg cmd: {' '.join(str(c) for c in cmd)}")
     try:
@@ -210,39 +213,61 @@ def _estimate_timeout(info, complexity=1.0):
 # ── Processing Functions ────────────────────────────────────────────────────
 
 def do_slomo(inp, out, factor):
-    """Smooth slow motion with motion-compensated interpolation."""
+    """
+    Slow motion using blend-mode interpolation.
+    MCI mode uses too much RAM for Railway containers, so we use blend
+    which is lighter and still produces smooth results.
+    For HD+ sources, we scale down to 720p for interpolation then back up.
+    """
     info = probe_info(inp)
     fps = info["fps"]
     br = _calc_bitrate(info["w"], info["h"], fps)
     timeout = _estimate_timeout(info, complexity=factor * 2.0)
-    # Use blend mode for very high factors to avoid extreme processing time
-    if factor >= 8:
-        mi_mode = "blend"
+
+    # For high-res, downscale → interpolate → upscale to save RAM
+    if info["h"] > 720:
+        # Scale to 720p for interpolation, then back to original size
+        vf = (
+            f"scale=-2:720,"
+            f"setpts={factor}*PTS,"
+            f"minterpolate=fps={fps}:mi_mode=blend,"
+            f"scale={info['w']}:{info['h']}:flags=lanczos"
+        )
     else:
-        mi_mode = "mci"
+        vf = (
+            f"setpts={factor}*PTS,"
+            f"minterpolate=fps={fps}:mi_mode=blend"
+        )
+
     _run(["ffmpeg", "-y", "-i", inp,
-          "-filter_complex",
-          f"[0:v]setpts={factor}*PTS,"
-          f"minterpolate=fps={fps}:mi_mode={mi_mode}:"
-          f"mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0[v]",
-          "-map", "[v]", "-an",
+          "-vf", vf,
+          "-an",
           "-r", str(fps),
-          "-video_track_timescale", "90000",
           *_hq_video_args(br), out], timeout=timeout)
 
 def do_smooth(inp, out, target_fps):
-    """Frame interpolation to target FPS."""
+    """
+    Frame interpolation to target FPS using blend mode.
+    For high-res, downscale → interpolate → upscale to stay within RAM.
+    """
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"], target_fps)
     complexity = target_fps / max(info["fps"], 1)
     timeout = _estimate_timeout(info, complexity=complexity * 1.5)
+
+    if info["h"] > 720:
+        vf = (
+            f"scale=-2:720,"
+            f"minterpolate=fps={target_fps}:mi_mode=blend,"
+            f"scale={info['w']}:{info['h']}:flags=lanczos"
+        )
+    else:
+        vf = f"minterpolate=fps={target_fps}:mi_mode=blend"
+
     _run(["ffmpeg", "-y", "-i", inp,
-          "-filter_complex",
-          f"[0:v]minterpolate=fps={target_fps}:mi_mode=mci:"
-          f"mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0[v]",
-          "-map", "[v]", "-map", "0:a?",
+          "-vf", vf,
+          "-map", "0:a?",
           "-r", str(target_fps),
-          "-video_track_timescale", "90000",
           *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
 def do_upscale(inp, out, target_h):
@@ -513,22 +538,21 @@ def do_denoise(inp, out, strength):
 
 def do_motionblur(inp, out, strength):
     """
-    RSMB-like motion blur: interpolate to high FPS then blend adjacent frames.
-    Uses blend mode for reliability on constrained servers.
+    Motion blur effect using frame blending.
+    Instead of interpolating to high FPS (RAM-heavy), we use tmix
+    to blend adjacent frames directly — achieves a similar look with
+    a fraction of the memory.
     """
     info = probe_info(inp)
     orig_fps = info["fps"]
     br = _calc_bitrate(info["w"], info["h"], orig_fps)
-    timeout = _estimate_timeout(info, complexity=3.0)
+    timeout = _estimate_timeout(info, complexity=2.0)
     blend_map = {"light": 2, "medium": 3, "heavy": 5}
     frames = blend_map.get(strength, 3)
-    interp_fps = orig_fps * frames
-    # Use blend mode instead of full MCI — much faster and avoids timeouts
+    # tmix blends N adjacent frames — produces motion blur without minterpolate
+    weights = " ".join(["1"] * frames)
     _run(["ffmpeg", "-y", "-i", inp,
-          "-vf",
-          f"minterpolate=fps={interp_fps}:mi_mode=blend,"
-          f"tmix=frames={frames}:weights=1,"
-          f"fps={orig_fps}",
+          "-vf", f"tmix=frames={frames}:weights={weights}",
           "-map", "0:a?",
           "-r", str(int(orig_fps)),
           *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
