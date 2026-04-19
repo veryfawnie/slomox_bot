@@ -3,6 +3,9 @@
 Telegram Video Studio Bot (Pyrogram MTProto)
 ─────────────────────────────────────────────
 Professional video processing. No file limits. Social-media ready.
+
+Fixed: session persistence, concurrency limits, minterpolate tuning,
+       timeout scaling, env-var config, error handling.
 """
 
 import os, asyncio, logging, subprocess, uuid, json, time, sys
@@ -12,22 +15,30 @@ from pyrogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup,
 )
 
-# ── Config ──────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8622684367:AAEaosDKzWoaO0bil7TstPoHtqGQHXFFO4I"
-API_ID = 6
-API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
-TEMP_DIR = "/tmp/vidbot"
+# ── Config (use env vars on Railway) ────────────────────────────────────────
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8622684367:AAEaosDKzWoaO0bil7TstPoHtqGQHXFFO4I")
+API_ID     = int(os.environ.get("API_ID", "6"))
+API_HASH   = os.environ.get("API_HASH", "eb06d4abfb49dc3eeb1aeb98ae0f581e")
+TEMP_DIR   = os.environ.get("TEMP_DIR", "/tmp/vidbot")
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))  # max simultaneous jobs
+
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Client("video_studio_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# in_memory=True avoids .session file on disk — critical for Railway's ephemeral FS
+app = Client(
+    "video_studio_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True,
+)
 user_state = {}
+processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 # ── Encoding Presets ────────────────────────────────────────────────────────
-# These ensure every output is device-compatible and social-media ready.
-# H.264 High Profile, Level 4.2, YUV420p, AAC LC 48kHz — the universal standard.
 
 def _hq_video_args(bitrate_mbps=12):
     """High-quality H.264 encoding args used by all processing functions."""
@@ -44,7 +55,7 @@ def _hq_video_args(bitrate_mbps=12):
     ]
 
 def _hq_audio_args():
-    """High-quality AAC audio args — 48kHz stereo, the social media standard."""
+    """High-quality AAC audio args — 48kHz stereo."""
     return ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
 
 def _calc_bitrate(width, height, fps=30):
@@ -58,11 +69,9 @@ def _calc_bitrate(width, height, fps=30):
         base = 8
     else:
         base = 5
-    # Scale for high FPS
     if fps > 30:
         base = int(base * (fps / 30) * 0.8)
     return base
-
 
 # ── FFmpeg Helpers ──────────────────────────────────────────────────────────
 
@@ -70,10 +79,20 @@ def _uid():
     return uuid.uuid4().hex[:10]
 
 def _run(cmd, timeout=600):
-    logger.info(f"FFmpeg: {' '.join(cmd[-3:])}")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Run an FFmpeg command with full stderr logging on failure."""
+    logger.info(f"FFmpeg: {' '.join(str(c) for c in cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"FFmpeg timed out after {timeout}s. "
+            "The video may be too long or the operation too heavy for this server. "
+            "Try a shorter clip or a lighter setting."
+        )
     if r.returncode != 0:
-        raise RuntimeError(r.stderr[-1500:])
+        # Log full stderr for debugging, send last portion to user
+        logger.error(f"FFmpeg stderr:\n{r.stderr}")
+        raise RuntimeError(r.stderr[-2000:])
 
 def probe_fps(path):
     r = subprocess.run(
@@ -112,50 +131,70 @@ def probe_info(path):
     except Exception:
         return {"w": 1920, "h": 1080, "fps": 30, "dur": 0, "br_kbps": 8000}
 
+def _estimate_timeout(info, complexity=1.0):
+    """Scale timeout based on video duration and operation complexity."""
+    dur = max(info.get("dur", 30), 10)
+    # base: ~10x realtime for simple ops, scaled by complexity
+    timeout = int(dur * 10 * complexity)
+    return max(timeout, 120)  # minimum 2 minutes
 
 # ── Processing Functions ────────────────────────────────────────────────────
 
 def do_slomo(inp, out, factor):
-    """FlowFrames-quality slow motion with motion-compensated interpolation."""
+    """Smooth slow motion with motion-compensated interpolation."""
     info = probe_info(inp)
     fps = info["fps"]
     br = _calc_bitrate(info["w"], info["h"], fps)
+    timeout = _estimate_timeout(info, complexity=factor * 2.0)
+    # Use blend mode for very high factors to avoid extreme processing time
+    if factor >= 8:
+        mi_mode = "blend"
+    else:
+        mi_mode = "mci"
     _run(["ffmpeg", "-y", "-i", inp,
           "-filter_complex",
-          f"[0:v]setpts={factor}*PTS,minterpolate=fps={fps}:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0[v]",
+          f"[0:v]setpts={factor}*PTS,"
+          f"minterpolate=fps={fps}:mi_mode={mi_mode}:"
+          f"mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0[v]",
           "-map", "[v]", "-an",
           "-r", str(fps),
           "-video_track_timescale", "90000",
-          *_hq_video_args(br), out])
+          *_hq_video_args(br), out], timeout=timeout)
 
 def do_smooth(inp, out, target_fps):
-    """Frame interpolation to target FPS — FlowFrames style."""
+    """Frame interpolation to target FPS."""
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"], target_fps)
+    complexity = target_fps / max(info["fps"], 1)
+    timeout = _estimate_timeout(info, complexity=complexity * 1.5)
     _run(["ffmpeg", "-y", "-i", inp,
           "-filter_complex",
-          f"[0:v]minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0[v]",
+          f"[0:v]minterpolate=fps={target_fps}:mi_mode=mci:"
+          f"mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0[v]",
           "-map", "[v]", "-map", "0:a?",
           "-r", str(target_fps),
           "-video_track_timescale", "90000",
-          *_hq_video_args(br), *_hq_audio_args(), out])
+          *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
 def do_upscale(inp, out, target_h):
-    """Lanczos upscale to exact resolution — 720p, 1080p, 4K."""
+    """Lanczos upscale to exact resolution."""
     res_map = {720: (1280, 720), 1080: (1920, 1080), 2160: (3840, 2160)}
     tw, th = res_map.get(target_h, (1920, target_h))
     br = _calc_bitrate(tw, th)
+    info = probe_info(inp)
+    timeout = _estimate_timeout(info, complexity=1.5)
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf", f"scale={tw}:{th}:flags=lanczos:force_original_aspect_ratio=decrease,"
                  f"pad={tw}:{th}:-1:-1:color=black,"
-                 f"unsharp=3:3:0.4:3:3:0.0",  # light sharpen after upscale
+                 f"unsharp=3:3:0.4:3:3:0.0",
           "-map", "0:v", "-map", "0:a?",
-          *_hq_video_args(br), *_hq_audio_args(), out])
+          *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
 def do_speed(inp, out, factor):
     """Speed up with proper audio tempo scaling."""
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"])
+    timeout = _estimate_timeout(info, complexity=1.0)
     atempo_chain = []
     rem = factor
     while rem > 2.0:
@@ -168,50 +207,57 @@ def do_speed(inp, out, factor):
               "-filter_complex",
               f"[0:v]setpts={1/factor}*PTS[v];[0:a]{af}[a]",
               "-map", "[v]", "-map", "[a]",
-              *_hq_video_args(br), *_hq_audio_args(), out])
+              *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
     except RuntimeError:
         _run(["ffmpeg", "-y", "-i", inp,
               "-vf", f"setpts={1/factor}*PTS", "-an",
-              *_hq_video_args(br), out])
+              *_hq_video_args(br), out], timeout=timeout)
 
 def do_reverse(inp, out):
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"])
+    timeout = _estimate_timeout(info, complexity=2.0)
     try:
         _run(["ffmpeg", "-y", "-i", inp,
               "-vf", "reverse", "-af", "areverse",
-              *_hq_video_args(br), *_hq_audio_args(), out])
+              *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
     except RuntimeError:
         _run(["ffmpeg", "-y", "-i", inp,
               "-vf", "reverse", "-an",
-              *_hq_video_args(br), out])
+              *_hq_video_args(br), out], timeout=timeout)
 
 def do_boomerang(inp, out):
     uid = _uid()
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"])
+    timeout = _estimate_timeout(info, complexity=2.5)
     fwd = os.path.join(TEMP_DIR, f"{uid}_fwd.mp4")
     rev = os.path.join(TEMP_DIR, f"{uid}_rev.mp4")
     lst = os.path.join(TEMP_DIR, f"{uid}_list.txt")
     try:
-        _run(["ffmpeg", "-y", "-i", inp, "-an", *_hq_video_args(br), fwd])
-        _run(["ffmpeg", "-y", "-i", fwd, "-vf", "reverse", "-an", *_hq_video_args(br), rev])
+        _run(["ffmpeg", "-y", "-i", inp, "-an", *_hq_video_args(br), fwd], timeout=timeout)
+        _run(["ffmpeg", "-y", "-i", fwd, "-vf", "reverse", "-an", *_hq_video_args(br), rev], timeout=timeout)
+        # Write concat list with proper newlines
         with open(lst, "w") as f:
-            f.write(f"file '{fwd}'\nfile '{rev}'\n")
+            f.write(f"file '{fwd}'\n")
+            f.write(f"file '{rev}'\n")
         _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
               "-c", "copy", "-movflags", "+faststart", out])
     finally:
         for p in (fwd, rev, lst):
-            if os.path.exists(p): os.remove(p)
+            if os.path.exists(p):
+                os.remove(p)
 
 def do_compress(inp, out, level):
     crf_map = {"light": 23, "medium": 28, "heavy": 34}
     crf = crf_map.get(level, 28)
+    info = probe_info(inp)
+    timeout = _estimate_timeout(info, complexity=1.0)
     _run(["ffmpeg", "-y", "-i", inp,
           "-c:v", "libx264", "-profile:v", "high", "-level:v", "4.2",
           "-pix_fmt", "yuv420p", "-preset", "slow", "-crf", str(crf),
           *_hq_audio_args(),
-          "-movflags", "+faststart", out])
+          "-movflags", "+faststart", out], timeout=timeout)
 
 def do_audio(inp, out):
     _run(["ffmpeg", "-y", "-i", inp,
@@ -228,26 +274,28 @@ def do_gif(inp, out, fps):
               "-lavfi", f"fps={fps},scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5",
               out])
     finally:
-        if os.path.exists(palette): os.remove(palette)
+        if os.path.exists(palette):
+            os.remove(palette)
 
 def do_rotate(inp, out, degrees):
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"])
+    timeout = _estimate_timeout(info, complexity=1.0)
     transpose_map = {90: "transpose=1", 180: "transpose=1,transpose=1", 270: "transpose=2"}
     vf = transpose_map.get(degrees, "transpose=1")
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf", vf, "-map", "0:v", "-map", "0:a?",
-          *_hq_video_args(br), *_hq_audio_args(), out])
+          *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
-
-# ── Topaz-like Enhancement Functions ────────────────────────────────────────
+# ── Enhancement Functions ────────────────────────────────────────────────────
 
 def do_enhance(inp, out, preset):
-    """Topaz-like enhancement — fast preset, no timeout risk."""
+    """Enhancement — denoise + sharpen + color correction."""
     info = probe_info(inp)
-    br = max(_calc_bitrate(info["w"], info["h"]) + 3, 12)  # bump bitrate for quality
+    br = max(_calc_bitrate(info["w"], info["h"]) + 3, 12)
+    timeout = _estimate_timeout(info, complexity=1.5)
     filter_presets = {
-        "auto": "hqdn3d=3:2:3:2,unsharp=5:5:0.8:5:5:0.0,eq=contrast=1.05:brightness=0.02:saturation=1.1",
+        "auto":  "hqdn3d=3:2:3:2,unsharp=5:5:0.8:5:5:0.0,eq=contrast=1.05:brightness=0.02:saturation=1.1",
         "sharp": "hqdn3d=1.5:1:1.5:1,unsharp=5:5:1.2:5:5:0.0,eq=contrast=1.06:brightness=0.01:saturation=1.05",
         "clean": "hqdn3d=6:4:6:4,unsharp=3:3:0.3:3:3:0.0,eq=contrast=1.03:saturation=1.05",
         "vivid": "hqdn3d=2:1.5:2:1.5,unsharp=5:5:0.6:5:5:0.0,eq=contrast=1.12:brightness=0.03:saturation=1.25:gamma=1.05",
@@ -256,7 +304,7 @@ def do_enhance(inp, out, preset):
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf", vf,
           "-map", "0:v", "-map", "0:a?",
-          *_hq_video_args(br), *_hq_audio_args(), out])
+          *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
 def do_stabilize(inp, out, strength):
     """Two-pass video stabilization."""
@@ -264,87 +312,82 @@ def do_stabilize(inp, out, strength):
     trf = os.path.join(TEMP_DIR, f"{uid}_transforms.trf")
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"])
+    timeout = _estimate_timeout(info, complexity=3.0)
     smooth_map = {"light": 10, "medium": 20, "heavy": 40}
     smoothing = smooth_map.get(strength, 20)
     try:
         _run(["ffmpeg", "-y", "-i", inp,
               "-vf", f"vidstabdetect=shakiness=8:accuracy=10:result={trf}",
-              "-f", "null", "/dev/null"])
+              "-f", "null", "/dev/null"], timeout=timeout)
         _run(["ffmpeg", "-y", "-i", inp,
               "-vf", f"vidstabtransform=input={trf}:smoothing={smoothing}:interpol=bicubic:crop=black:zoom=3,"
                      f"unsharp=3:3:0.3:3:3:0.0",
               "-map", "0:v", "-map", "0:a?",
-              *_hq_video_args(br), *_hq_audio_args(), out])
+              *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
     finally:
-        if os.path.exists(trf): os.remove(trf)
+        if os.path.exists(trf):
+            os.remove(trf)
 
 def do_denoise(inp, out, strength):
-    """Noise/grain removal — hqdn3d for speed, preserves detail."""
+    """Noise/grain removal."""
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"])
+    timeout = _estimate_timeout(info, complexity=1.5)
     noise_map = {
         "light":  "hqdn3d=3:2:3:2",
         "medium": "hqdn3d=6:4:6:4",
         "heavy":  "hqdn3d=10:8:10:8",
     }
     vf = noise_map.get(strength, noise_map["medium"])
-    vf += ",unsharp=3:3:0.4:3:3:0.0"  # resharpening pass
+    vf += ",unsharp=3:3:0.4:3:3:0.0"
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf", vf, "-map", "0:v", "-map", "0:a?",
-          *_hq_video_args(br), *_hq_audio_args(), out])
+          *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
 def do_motionblur(inp, out, strength):
     """
     RSMB-like motion blur: interpolate to high FPS then blend adjacent frames.
-    Creates natural per-object motion blur like ReelSmart Motion Blur.
+    Uses blend mode for reliability on constrained servers.
     """
     info = probe_info(inp)
     orig_fps = info["fps"]
     br = _calc_bitrate(info["w"], info["h"], orig_fps)
-    # Strength controls how many frames we blend
+    timeout = _estimate_timeout(info, complexity=3.0)
     blend_map = {"light": 2, "medium": 3, "heavy": 5}
     frames = blend_map.get(strength, 3)
-    # Step 1: interpolate to higher FPS for more temporal data
     interp_fps = orig_fps * frames
-    # Step 2: tmix blends N consecutive frames, then fps filter brings it back to original
+    # Use blend mode instead of full MCI — much faster and avoids timeouts
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf",
-          f"minterpolate=fps={interp_fps}:mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=epzs:vsbmc=0,"
+          f"minterpolate=fps={interp_fps}:mi_mode=blend,"
           f"tmix=frames={frames}:weights=1,"
           f"fps={orig_fps}",
           "-map", "0:a?",
-          "-r", str(orig_fps),
-          *_hq_video_args(br), *_hq_audio_args(), out])
+          "-r", str(int(orig_fps)),
+          *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
 
 def do_social(inp, out, platform):
-    """
-    Social-media optimized export — encodes to exact platform specs so
-    Instagram/TikTok/YouTube won't recompress your video.
-    """
+    """Social-media optimized export."""
     info = probe_info(inp)
     w, h = info["w"], info["h"]
+    timeout = _estimate_timeout(info, complexity=1.5)
 
     if platform == "ig_reel":
-        # Instagram Reels: 1080x1920, 30fps, H.264 High, ~12Mbps, AAC 48kHz
         vf = "scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:-1:-1:color=black"
         br, fps_out = 12, 30
     elif platform == "ig_post":
-        # Instagram Post: 1080x1080, 30fps, ~8Mbps
         vf = "scale=1080:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1080:-1:-1:color=black"
         br, fps_out = 8, 30
     elif platform == "tiktok":
-        # TikTok: 1080x1920, 30fps, ~10Mbps
         vf = "scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:-1:-1:color=black"
         br, fps_out = 10, 30
     elif platform == "youtube":
-        # YouTube: keep original res, high bitrate, 60fps if source is >30
         target_fps = 60 if info["fps"] > 30 else 30
         vf = f"scale='if(gt(iw,1920),1920,-2)':'if(gt(iw,1920),-2,ih)':flags=lanczos"
         br = _calc_bitrate(min(w, 1920), h, target_fps)
-        br = max(br, 15)  # YouTube wants high bitrate
+        br = max(br, 15)
         fps_out = target_fps
     elif platform == "twitter":
-        # Twitter/X: 1280x720 or 1920x1080, 30fps, ~5Mbps
         vf = "scale='if(gt(iw,1920),1920,-2)':'if(gt(iw,1920),-2,ih)':flags=lanczos"
         br, fps_out = 8, 30
     else:
@@ -358,27 +401,26 @@ def do_social(inp, out, platform):
           "-pix_fmt", "yuv420p", "-preset", "fast",
           "-b:v", f"{br}M", "-maxrate", f"{int(br * 1.5)}M", "-bufsize", f"{br * 2}M",
           *_hq_audio_args(),
-          "-movflags", "+faststart", out])
-
+          "-movflags", "+faststart", out], timeout=timeout)
 
 # ── Mode Definitions ────────────────────────────────────────────────────────
 
 MODES = {
-    "slomo":       {"icon": "🎬", "title": "Slow-Motion",     "prompt": "Send me a video — I'll create FlowFrames-quality smooth slow motion."},
-    "smooth":      {"icon": "✨", "title": "Smooth FPS",       "prompt": "Send me a video — I'll interpolate it to silky high frame rates."},
-    "motionblur":  {"icon": "💨", "title": "Motion Blur",      "prompt": "Send me a video — I'll add RSMB-style per-object motion blur."},
-    "upscale":     {"icon": "🔍", "title": "Upscale",          "prompt": "Send me a video — I'll upscale it with sharpening to higher resolution."},
-    "speed":       {"icon": "⚡", "title": "Speed Up",          "prompt": "Send me a video — I'll speed it up with proper frame blending."},
-    "reverse":     {"icon": "⏪", "title": "Reverse",          "prompt": "Send me a video — I'll reverse it."},
-    "boomerang":   {"icon": "🔁", "title": "Boomerang",        "prompt": "Send me a video — I'll make a forward + reverse loop."},
-    "enhance":     {"icon": "💎", "title": "Enhance",          "prompt": "Send me a video — I'll apply Topaz-like sharpening, denoising, and color correction."},
-    "stabilize":   {"icon": "🎯", "title": "Stabilize",        "prompt": "Send me a shaky video — I'll smooth the camera motion."},
-    "denoise":     {"icon": "🧹", "title": "Denoise",          "prompt": "Send me a noisy video — I'll clean up grain and noise."},
-    "social":      {"icon": "📱", "title": "Social Export",     "prompt": "Send me a video — I'll export it optimized for your platform so it won't lose quality."},
-    "compress":    {"icon": "📦", "title": "Compress",         "prompt": "Send me a video — I'll reduce the file size."},
-    "audio":       {"icon": "🎵", "title": "Extract Audio",    "prompt": "Send me a video — I'll extract the audio as high-quality MP3."},
-    "gif":         {"icon": "🎞️", "title": "Convert to GIF",   "prompt": "Send me a video — I'll turn it into an optimized GIF."},
-    "rotate":      {"icon": "🔄", "title": "Rotate",           "prompt": "Send me a video — I'll rotate it."},
+    "slomo":      {"icon": "🎬", "title": "Slow-Motion",    "prompt": "Send me a video — I'll create smooth slow motion."},
+    "smooth":     {"icon": "✨", "title": "Smooth FPS",     "prompt": "Send me a video — I'll interpolate it to high frame rates."},
+    "motionblur": {"icon": "💨", "title": "Motion Blur",    "prompt": "Send me a video — I'll add RSMB-style motion blur."},
+    "upscale":    {"icon": "🔍", "title": "Upscale",        "prompt": "Send me a video — I'll upscale it with sharpening."},
+    "speed":      {"icon": "⚡", "title": "Speed Up",       "prompt": "Send me a video — I'll speed it up with frame blending."},
+    "reverse":    {"icon": "⏪", "title": "Reverse",        "prompt": "Send me a video — I'll reverse it."},
+    "boomerang":  {"icon": "🔁", "title": "Boomerang",      "prompt": "Send me a video — I'll make a forward + reverse loop."},
+    "enhance":    {"icon": "💎", "title": "Enhance",        "prompt": "Send me a video — I'll sharpen, denoise, and color correct."},
+    "stabilize":  {"icon": "🎯", "title": "Stabilize",      "prompt": "Send me a shaky video — I'll smooth the camera motion."},
+    "denoise":    {"icon": "🧹", "title": "Denoise",        "prompt": "Send me a noisy video — I'll clean up grain and noise."},
+    "social":     {"icon": "📱", "title": "Social Export",   "prompt": "Send me a video — I'll export it optimized for your platform."},
+    "compress":   {"icon": "📦", "title": "Compress",       "prompt": "Send me a video — I'll reduce the file size."},
+    "audio":      {"icon": "🎵", "title": "Extract Audio",  "prompt": "Send me a video — I'll extract the audio as MP3."},
+    "gif":        {"icon": "🎞️", "title": "Convert to GIF", "prompt": "Send me a video — I'll turn it into an optimized GIF."},
+    "rotate":     {"icon": "🔄", "title": "Rotate",         "prompt": "Send me a video — I'll rotate it."},
 }
 
 OPTION_KEYBOARDS = {
@@ -478,7 +520,6 @@ WELCOME_TEXT = (
     "Pick a command and send your video!"
 )
 
-
 # ── Callback Parser ─────────────────────────────────────────────────────────
 
 def _parse_callback(data):
@@ -519,7 +560,6 @@ def _parse_callback(data):
         return f"{labels.get(platform, platform)} export", do_social, (platform,)
     return None, None, ()
 
-
 # ── Download / Upload ───────────────────────────────────────────────────────
 
 async def send_result(client, chat_id, out_path, mode, orig_name, status_msg):
@@ -555,7 +595,6 @@ async def send_result(client, chat_id, out_path, mode, orig_name, status_msg):
     except Exception:
         pass
 
-
 async def process_video(client, chat_id, video_msg, mode, process_fn, args, status_msg):
     uid = _uid()
     orig_name = getattr(video_msg.video, "file_name", None) or \
@@ -564,30 +603,56 @@ async def process_video(client, chat_id, video_msg, mode, process_fn, args, stat
     inp = os.path.join(TEMP_DIR, f"{uid}_input.mp4")
     out = os.path.join(TEMP_DIR, f"{uid}_output{ext}")
 
+    # Acquire semaphore to limit concurrent processing
+    acquired = False
     try:
-        await status_msg.edit_text("Downloading your video...")
+        # Try to acquire immediately
+        acquired = processing_semaphore._value > 0
+        if not acquired:
+            await status_msg.edit_text(
+                f"⏳ Server is busy processing other videos. You're in queue...\n"
+                f"Your {MODES[mode]['title']} job will start automatically.")
+        await processing_semaphore.acquire()
+        acquired = True
+
+        await status_msg.edit_text("⬇️ Downloading your video...")
         await client.download_media(video_msg, file_name=inp)
 
+        if not os.path.exists(inp):
+            raise RuntimeError("Failed to download the video. Please try sending it again.")
+
+        file_mb = os.path.getsize(inp) / (1024 * 1024)
+        info = probe_info(inp)
         await status_msg.edit_text(
-            f"Processing {MODES[mode]['title']}...\nThis may take a moment. Please wait.")
+            f"⚙️ Processing {MODES[mode]['title']}...\n"
+            f"📁 {file_mb:.1f} MB | {info['w']}x{info['h']} | {info['fps']} FPS\n"
+            f"Please wait — this may take a while for large/HD videos.")
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, process_fn, inp, out, *args)
 
-        await status_msg.edit_text("Uploading your result...")
+        await status_msg.edit_text("⬆️ Uploading your result...")
         await send_result(client, chat_id, out, mode, orig_name, status_msg)
 
     except Exception as e:
         logger.error(f"Processing error: {e}")
         err_text = str(e)[:400]
         try:
-            await status_msg.edit_text(f"Processing failed:\n{err_text}\n\nTry a different video or setting.")
+            await status_msg.edit_text(
+                f"❌ Processing failed:\n{err_text}\n\n"
+                f"Try a shorter clip or a different setting.")
         except Exception:
-            await client.send_message(chat_id, f"Processing failed:\n{err_text}")
+            await client.send_message(chat_id,
+                f"❌ Processing failed:\n{err_text}")
     finally:
+        if acquired:
+            processing_semaphore.release()
         for p in (inp, out):
-            if os.path.exists(p): os.remove(p)
-
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 # ── Command Handlers ────────────────────────────────────────────────────────
 
@@ -628,7 +693,8 @@ async def on_video(client, message: Message):
         status_msg = await message.reply_text(f"Starting {MODES[mode]['title']}...")
         fn_map = {"reverse": (do_reverse, ()), "boomerang": (do_boomerang, ()), "audio": (do_audio, ())}
         fn, args = fn_map[mode]
-        await process_video(client, message.chat.id, message, mode, fn, args, status_msg)
+        asyncio.create_task(
+            process_video(client, message.chat.id, message, mode, fn, args, status_msg))
         return
 
     if mode in OPTION_KEYBOARDS:
@@ -660,11 +726,11 @@ async def on_callback(client, callback_query: CallbackQuery):
         return
 
     await callback_query.message.edit_text(f"Starting {label}...")
-    await process_video(client, callback_query.message.chat.id, video_msg,
-                        mode, process_fn, args, callback_query.message)
+    asyncio.create_task(
+        process_video(client, callback_query.message.chat.id, video_msg,
+                      mode, process_fn, args, callback_query.message))
 
-
-# ── Auto-restart Runner ─────────────────────────────────────────────────────
+# ── Startup ──────────────────────────────────────────────────────────────────
 
 def _register_handlers(application):
     application.on_message(filters.command("start") | filters.command("help"))(start_cmd)
@@ -685,7 +751,13 @@ def run_forever():
         except Exception as e:
             logger.error(f"Bot crashed: {e}. Restarting in 5s...")
             time.sleep(5)
-            app = Client("video_studio_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+            app = Client(
+                "video_studio_bot",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=BOT_TOKEN,
+                in_memory=True,
+            )
             _register_handlers(app)
 
 if __name__ == "__main__":
