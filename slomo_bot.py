@@ -104,7 +104,19 @@ def _uid():
     return uuid.uuid4().hex[:10]
 
 def _run(cmd, timeout=600):
-    """Run an FFmpeg command with full stderr logging on failure."""
+    """Run an FFmpeg command with full stderr logging on failure.
+
+    IMPORTANT: We inject -loglevel error right after the 'ffmpeg' binary
+    to suppress the version banner and configuration dump that FFmpeg
+    normally prints to stderr. This way, on failure we only see the
+    actual error lines — not pages of 'enable-libfoo disable-bar'.
+    """
+    # Inject -loglevel error after the binary name so only real errors appear
+    cmd = list(cmd)  # ensure mutable copy
+    if cmd and cmd[0] in ("ffmpeg", "ffmpeg.exe"):
+        cmd.insert(1, "-loglevel")
+        cmd.insert(2, "error")
+
     logger.info(f"FFmpeg cmd: {' '.join(str(c) for c in cmd)}")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -116,25 +128,24 @@ def _run(cmd, timeout=600):
         )
     if r.returncode != 0:
         logger.error(f"FFmpeg FULL stderr:\n{r.stderr}")
-        # FFmpeg writes progress to stderr too, so we need to extract real errors.
-        # Strategy: grab lines with error keywords, OR first+last 3 lines as fallback.
+        # With -loglevel error the banner is suppressed, but just in case,
+        # filter out any remaining config/banner noise.
         lines = [l.strip() for l in r.stderr.strip().split('\n') if l.strip()]
-        err_keywords = ['error', 'invalid', 'failed', 'no such', 'unknown',
-                        'not found', 'cannot', 'killed', 'signal', 'denied',
-                        'memory', 'overflow', 'corrupt', 'unable', 'unrecognized',
-                        'option', 'mismatch', 'exceeds', 'too']
-        error_lines = [l for l in lines
-                       if any(k in l.lower() for k in err_keywords)
-                       and 'frame=' not in l  # skip progress lines
-                       and 'encoder' not in l.lower()]  # skip metadata
-        if error_lines:
-            err_msg = '\n'.join(error_lines[-6:])
-        elif len(lines) <= 10:
-            err_msg = '\n'.join(lines)
+        # Skip lines that are clearly FFmpeg banner / build info
+        skip_patterns = ['configuration:', 'built with', 'ffmpeg version',
+                         'libavutil', 'libavcodec', 'libavformat',
+                         'libavdevice', 'libavfilter', 'libswscale',
+                         'libswresample', 'libpostproc', 'copyright']
+        real_lines = [l for l in lines
+                      if not any(p in l.lower() for p in skip_patterns)
+                      and 'frame=' not in l]  # skip progress lines
+        if real_lines:
+            err_msg = '\n'.join(real_lines[-8:])
+        elif lines:
+            err_msg = '\n'.join(lines[-5:])
         else:
-            # Show first 3 + last 3 lines (errors often at boundaries)
-            err_msg = '\n'.join(lines[:3] + ['...'] + lines[-3:])
-        raise RuntimeError(err_msg[:1500] if err_msg else f"FFmpeg exited with code {r.returncode}")
+            err_msg = f"FFmpeg exited with code {r.returncode}"
+        raise RuntimeError(err_msg[:1500])
 
 def probe_fps(path):
     r = subprocess.run(
