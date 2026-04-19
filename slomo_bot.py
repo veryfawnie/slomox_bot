@@ -214,58 +214,34 @@ def _estimate_timeout(info, complexity=1.0):
 
 def do_slomo(inp, out, factor):
     """
-    Slow motion using blend-mode interpolation.
-    MCI mode uses too much RAM for Railway containers, so we use blend
-    which is lighter and still produces smooth results.
-    For HD+ sources, we scale down to 720p for interpolation then back up.
+    Slow motion using PTS manipulation + FFmpeg's native frame duplication.
+    minterpolate is removed — it's unreliable on constrained servers
+    (either OOMs or produces corrupt/blank output).
+    setpts gives clean, reliable slow motion by duplicating frames.
     """
     info = probe_info(inp)
     fps = info["fps"]
     br = _calc_bitrate(info["w"], info["h"], fps)
-    timeout = _estimate_timeout(info, complexity=factor * 2.0)
-
-    # For high-res, downscale → interpolate → upscale to save RAM
-    if info["h"] > 720:
-        # Scale to 720p for interpolation, then back to original size
-        vf = (
-            f"scale=-2:720,"
-            f"setpts={factor}*PTS,"
-            f"minterpolate=fps={fps}:mi_mode=blend,"
-            f"scale={info['w']}:{info['h']}:flags=lanczos"
-        )
-    else:
-        vf = (
-            f"setpts={factor}*PTS,"
-            f"minterpolate=fps={fps}:mi_mode=blend"
-        )
+    timeout = _estimate_timeout(info, complexity=factor * 1.5)
 
     _run(["ffmpeg", "-y", "-i", inp,
-          "-vf", vf,
+          "-vf", f"setpts={factor}*PTS",
           "-an",
           "-r", str(fps),
           *_hq_video_args(br), out], timeout=timeout)
 
 def do_smooth(inp, out, target_fps):
     """
-    Frame interpolation to target FPS using blend mode.
-    For high-res, downscale → interpolate → upscale to stay within RAM.
+    Frame rate conversion using FFmpeg's native fps filter.
+    minterpolate is removed — unreliable on constrained servers.
+    The fps filter with scene-change detection produces clean results.
     """
     info = probe_info(inp)
     br = _calc_bitrate(info["w"], info["h"], target_fps)
-    complexity = target_fps / max(info["fps"], 1)
-    timeout = _estimate_timeout(info, complexity=complexity * 1.5)
-
-    if info["h"] > 720:
-        vf = (
-            f"scale=-2:720,"
-            f"minterpolate=fps={target_fps}:mi_mode=blend,"
-            f"scale={info['w']}:{info['h']}:flags=lanczos"
-        )
-    else:
-        vf = f"minterpolate=fps={target_fps}:mi_mode=blend"
+    timeout = _estimate_timeout(info, complexity=1.5)
 
     _run(["ffmpeg", "-y", "-i", inp,
-          "-vf", vf,
+          "-vf", f"fps={target_fps}",
           "-map", "0:a?",
           "-r", str(target_fps),
           *_hq_video_args(br), *_hq_audio_args(), out], timeout=timeout)
@@ -767,6 +743,14 @@ async def send_result(client, chat_id, out_path, mode, orig_name, status_msg):
         raise RuntimeError("Output file was not created.")
 
     out_mb = os.path.getsize(out_path) / (1024 * 1024)
+
+    # Sanity check — reject suspiciously small video files (likely corrupt/blank)
+    if mode not in ("audio", "gif") and out_mb < 0.1:
+        raise RuntimeError(
+            "Output video is too small (likely corrupt). "
+            "Try a different setting or a shorter clip."
+        )
+
     base = os.path.splitext(orig_name)[0]
 
     info = probe_info(out_path)
@@ -791,13 +775,12 @@ async def send_result(client, chat_id, out_path, mode, orig_name, status_msg):
             file_name=f"{base}.gif",
             caption=f"Here's your GIF ({out_mb:.1f} MB). Long-press to save.")
     else:
-        # send_video streams progressively — much faster delivery than send_document
-        await client.send_video(chat_id, out_path,
+        # send_document with force_document=True sends the raw file
+        # without Telegram re-encoding — preserves exact quality
+        await client.send_document(chat_id, out_path,
             file_name=f"{base}_{mode}.mp4",
             caption=f"Tap to save to your device.{specs}",
-            width=info["w"], height=info["h"],
-            duration=int(info["dur"]),
-            supports_streaming=True)
+            force_document=True)
 
     try:
         await status_msg.edit_text("Done! Your file is ready above.")
