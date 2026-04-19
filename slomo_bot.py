@@ -88,22 +88,20 @@ def _hq_audio_args():
 def _calc_bitrate(width, height, fps=30):
     """
     Calculate bitrate based on resolution and FPS.
-    Tuned for premium quality — higher than typical streaming bitrates
-    to preserve detail on Retina/OLED displays.
+    Balanced for quality + fast Telegram upload. Roughly matches
+    YouTube recommended bitrates (which look great on any display).
     """
     pixels = width * height
-    if pixels >= 7680 * 4320:     # 8K
-        base = 120
-    elif pixels >= 3840 * 2160:   # 4K
-        base = 55
+    if pixels >= 3840 * 2160:   # 4K
+        base = 25
     elif pixels >= 2560 * 1440:   # 1440p
-        base = 30
+        base = 16
     elif pixels >= 1920 * 1080:   # 1080p
-        base = 20
+        base = 10
     elif pixels >= 1280 * 720:    # 720p
-        base = 12
+        base = 6
     else:
-        base = 8
+        base = 4
     if fps > 30:
         base = int(base * (fps / 30) * 0.85)
     return base
@@ -542,31 +540,31 @@ def do_social(inp, out, platform):
     timeout = _estimate_timeout(info, complexity=2.0)
 
     if platform == "ig_reel":
-        vf = ("scale=1080:1920:flags=lanczos+accurate_rnd:force_original_aspect_ratio=decrease,"
+        vf = ("scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,"
               "pad=1080:1920:-1:-1:color=black,"
               "unsharp=3:3:0.3:3:3:0.0")
-        br, fps_out = 15, 30
+        br, fps_out = 8, 30
     elif platform == "ig_post":
-        vf = ("scale=1080:1080:flags=lanczos+accurate_rnd:force_original_aspect_ratio=decrease,"
+        vf = ("scale=1080:1080:flags=lanczos:force_original_aspect_ratio=decrease,"
               "pad=1080:1080:-1:-1:color=black,"
               "unsharp=3:3:0.3:3:3:0.0")
-        br, fps_out = 12, 30
+        br, fps_out = 6, 30
     elif platform == "tiktok":
-        vf = ("scale=1080:1920:flags=lanczos+accurate_rnd:force_original_aspect_ratio=decrease,"
+        vf = ("scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,"
               "pad=1080:1920:-1:-1:color=black,"
               "unsharp=3:3:0.3:3:3:0.0")
-        br, fps_out = 15, 30
+        br, fps_out = 8, 30
     elif platform == "youtube":
         target_fps = 60 if info["fps"] > 30 else 30
-        vf = (f"scale='if(gt(iw,3840),3840,-2)':'if(gt(iw,3840),-2,ih)':flags=lanczos+accurate_rnd,"
+        vf = (f"scale='if(gt(iw,3840),3840,-2)':'if(gt(iw,3840),-2,ih)':flags=lanczos,"
               "unsharp=3:3:0.3:3:3:0.0")
         br = _calc_bitrate(min(w, 3840), h, target_fps)
-        br = max(br, 25)
+        br = max(br, 12)
         fps_out = target_fps
     elif platform == "twitter":
-        vf = ("scale='if(gt(iw,1920),1920,-2)':'if(gt(iw,1920),-2,ih)':flags=lanczos+accurate_rnd,"
+        vf = ("scale='if(gt(iw,1920),1920,-2)':'if(gt(iw,1920),-2,ih)':flags=lanczos,"
               "unsharp=3:3:0.3:3:3:0.0")
-        br, fps_out = 12, 30
+        br, fps_out = 6, 30
     else:
         vf = "null"
         br, fps_out = 15, 30
@@ -754,6 +752,12 @@ async def send_result(client, chat_id, out_path, mode, orig_name, status_msg):
     br_mbps = info["br_kbps"] / 1000
     specs += f" | {br_mbps:.1f} Mbps"
 
+    # Update status with file size so user knows upload is happening
+    try:
+        await status_msg.edit_text(f"⬆️ Uploading {out_mb:.1f} MB...")
+    except Exception:
+        pass
+
     if mode == "audio":
         await client.send_audio(chat_id, out_path,
             file_name=f"{base}_audio.mp3",
@@ -763,10 +767,13 @@ async def send_result(client, chat_id, out_path, mode, orig_name, status_msg):
             file_name=f"{base}.gif",
             caption=f"Here's your GIF ({out_mb:.1f} MB). Long-press to save.")
     else:
-        await client.send_document(chat_id, out_path,
+        # send_video streams progressively — much faster delivery than send_document
+        await client.send_video(chat_id, out_path,
             file_name=f"{base}_{mode}.mp4",
             caption=f"Tap to save to your device.{specs}",
-            force_document=True)
+            width=info["w"], height=info["h"],
+            duration=int(info["dur"]),
+            supports_streaming=True)
 
     try:
         await status_msg.edit_text("Done! Your file is ready above.")
