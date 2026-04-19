@@ -42,10 +42,8 @@ processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 def _hq_video_args(bitrate_mbps=12, preset="medium"):
     """
-    Premium H.264 encoding with bitrate target.
-    Default preset=medium balances quality vs Railway CPU.
-    Use preset=slow only for upscale/enhance where it matters.
-    Level 5.2 required for 4K+, tune=film for cinematic content.
+    H.264 High Profile encoding with premium bitrate targets.
+    Quality comes from high bitrate + good preset, not exotic x264 flags.
     """
     return [
         "-c:v", "libx264",
@@ -53,19 +51,15 @@ def _hq_video_args(bitrate_mbps=12, preset="medium"):
         "-level:v", "5.2",
         "-pix_fmt", "yuv420p",
         "-preset", preset,
-        "-tune", "film",
         "-b:v", f"{bitrate_mbps}M",
         "-maxrate", f"{int(bitrate_mbps * 1.8)}M",
         "-bufsize", f"{bitrate_mbps * 3}M",
-        "-deblock", "-1:-1",
-        "-x264-params", "aq-mode=3:aq-strength=0.8:ref=4:bframes=4:b-adapt=2:rc-lookahead=40:me=umh:subme=8:trellis=2",
         "-movflags", "+faststart",
     ]
 
 def _ultra_video_args(crf=15, preset="slow"):
     """
-    Maximum quality CRF encoding for upscale/enhance operations.
-    CRF mode lets x264 allocate bits where they matter most.
+    CRF encoding for upscale/enhance — lets x264 allocate bits to detail.
     """
     return [
         "-c:v", "libx264",
@@ -73,10 +67,7 @@ def _ultra_video_args(crf=15, preset="slow"):
         "-level:v", "5.2",
         "-pix_fmt", "yuv420p",
         "-preset", preset,
-        "-tune", "film",
         "-crf", str(crf),
-        "-deblock", "-1:-1",
-        "-x264-params", "aq-mode=3:aq-strength=0.7:ref=5:bframes=5:b-adapt=2:rc-lookahead=50:me=umh:subme=9:trellis=2",
         "-movflags", "+faststart",
     ]
 
@@ -114,7 +105,7 @@ def _uid():
 
 def _run(cmd, timeout=600):
     """Run an FFmpeg command with full stderr logging on failure."""
-    logger.info(f"FFmpeg: {' '.join(str(c) for c in cmd)}")
+    logger.info(f"FFmpeg cmd: {' '.join(str(c) for c in cmd)}")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -124,20 +115,26 @@ def _run(cmd, timeout=600):
             "Try a shorter clip or a lighter setting."
         )
     if r.returncode != 0:
-        logger.error(f"FFmpeg stderr:\n{r.stderr}")
-        # Extract the actual error lines — FFmpeg puts errors after "Error" or at the end
-        # but stream info bloats stderr. Find the meaningful part.
-        lines = r.stderr.strip().split('\n')
-        error_lines = [l for l in lines if any(k in l.lower() for k in
-                       ['error', 'invalid', 'failed', 'no such', 'unknown',
+        logger.error(f"FFmpeg FULL stderr:\n{r.stderr}")
+        # FFmpeg writes progress to stderr too, so we need to extract real errors.
+        # Strategy: grab lines with error keywords, OR first+last 3 lines as fallback.
+        lines = [l.strip() for l in r.stderr.strip().split('\n') if l.strip()]
+        err_keywords = ['error', 'invalid', 'failed', 'no such', 'unknown',
                         'not found', 'cannot', 'killed', 'signal', 'denied',
-                        'memory', 'overflow', 'corrupt'])]
+                        'memory', 'overflow', 'corrupt', 'unable', 'unrecognized',
+                        'option', 'mismatch', 'exceeds', 'too']
+        error_lines = [l for l in lines
+                       if any(k in l.lower() for k in err_keywords)
+                       and 'frame=' not in l  # skip progress lines
+                       and 'encoder' not in l.lower()]  # skip metadata
         if error_lines:
-            err_msg = '\n'.join(error_lines[-5:])
+            err_msg = '\n'.join(error_lines[-6:])
+        elif len(lines) <= 10:
+            err_msg = '\n'.join(lines)
         else:
-            # Fallback: last few lines which usually have the error
-            err_msg = '\n'.join(lines[-5:])
-        raise RuntimeError(err_msg[:1500])
+            # Show first 3 + last 3 lines (errors often at boundaries)
+            err_msg = '\n'.join(lines[:3] + ['...'] + lines[-3:])
+        raise RuntimeError(err_msg[:1500] if err_msg else f"FFmpeg exited with code {r.returncode}")
 
 def probe_fps(path):
     r = subprocess.run(
