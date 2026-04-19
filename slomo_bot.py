@@ -20,7 +20,7 @@ BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8622684367:AAEaosDKzWoaO0bil7TstPoHtqG
 API_ID     = int(os.environ.get("API_ID", "6"))
 API_HASH   = os.environ.get("API_HASH", "eb06d4abfb49dc3eeb1aeb98ae0f581e")
 TEMP_DIR   = os.environ.get("TEMP_DIR", "/tmp/vidbot")
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))  # max simultaneous jobs
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))  # limit to 1 to avoid OOM
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -40,31 +40,41 @@ processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 # ── Encoding Presets ────────────────────────────────────────────────────────
 
+def _mem_threads():
+    """
+    Limit threads to control peak RAM usage on small Railway containers.
+    Each x264 thread holds a full frame buffer, so fewer threads = less RAM.
+    """
+    return ["-threads", "2"]
+
 def _hq_video_args(bitrate_mbps=12, preset="medium"):
     """
     H.264 High Profile encoding with premium bitrate targets.
     Quality comes from high bitrate + good preset, not exotic x264 flags.
     """
     return [
+        *_mem_threads(),
         "-c:v", "libx264",
         "-profile:v", "high",
-        "-level:v", "5.2",
+        "-level:v", "4.2",
         "-pix_fmt", "yuv420p",
         "-preset", preset,
         "-b:v", f"{bitrate_mbps}M",
-        "-maxrate", f"{int(bitrate_mbps * 1.8)}M",
-        "-bufsize", f"{bitrate_mbps * 3}M",
+        "-maxrate", f"{int(bitrate_mbps * 1.5)}M",
+        "-bufsize", f"{bitrate_mbps * 2}M",
         "-movflags", "+faststart",
     ]
 
-def _ultra_video_args(crf=15, preset="slow"):
+def _ultra_video_args(crf=17, preset="medium"):
     """
     CRF encoding for upscale/enhance — lets x264 allocate bits to detail.
+    preset=medium instead of slow to halve RAM usage.
     """
     return [
+        *_mem_threads(),
         "-c:v", "libx264",
         "-profile:v", "high",
-        "-level:v", "5.2",
+        "-level:v", "4.2",
         "-pix_fmt", "yuv420p",
         "-preset", preset,
         "-crf", str(crf),
@@ -128,6 +138,14 @@ def _run(cmd, timeout=600):
         )
     if r.returncode != 0:
         logger.error(f"FFmpeg FULL stderr:\n{r.stderr}")
+
+        # Exit code -9 = SIGKILL = OOM (out of memory) — give a clear message
+        if r.returncode == -9:
+            raise RuntimeError(
+                "Server ran out of memory processing this video. "
+                "Try a lower resolution, shorter clip, or lighter setting."
+            )
+
         # With -loglevel error the banner is suppressed, but just in case,
         # filter out any remaining config/banner noise.
         lines = [l.strip() for l in r.stderr.strip().split('\n') if l.strip()]
@@ -231,117 +249,87 @@ def do_smooth(inp, out, target_fps):
 
 def do_upscale(inp, out, target_h):
     """
-    Multi-pass Topaz-style upscale pipeline:
-      1. Denoise source (clean before scaling to avoid amplifying noise)
-      2. Lanczos upscale with +accurate_rnd +full_chroma_int
-      3. Multi-radius unsharp mask (detail + edge recovery)
-      4. Adaptive contrast enhancement
-      5. CRF encoding at ultra quality for maximum detail retention
+    High-quality upscale pipeline (memory-safe for Railway containers):
+      1. Light denoise source (avoid amplifying noise)
+      2. Lanczos upscale
+      3. Single-pass unsharp mask for detail recovery
+      4. Subtle contrast/color enhancement
+      5. CRF encoding for quality
 
-    For 8K: two-step upscale (src → 4K → 8K) with sharpening at each stage.
+    8K is not available — Railway containers don't have enough RAM for it.
+    Max is 4K (3840x2160).
     """
+    # Cap at 4K — 8K requires 8+ GB RAM which Railway doesn't provide
+    if target_h > 2160:
+        target_h = 2160
+
     res_map = {
         720:  (1280, 720),
         1080: (1920, 1080),
         1440: (2560, 1440),
         2160: (3840, 2160),
-        4320: (7680, 4320),
     }
     tw, th = res_map.get(target_h, (1920, target_h))
     info = probe_info(inp)
     src_pixels = info["w"] * info["h"]
     dst_pixels = tw * th
 
-    # Determine CRF based on target resolution
-    if target_h >= 4320:
-        crf = 14
-        complexity = 6.0
-    elif target_h >= 2160:
-        crf = 15
-        complexity = 4.0
-    elif target_h >= 1440:
-        crf = 16
-        complexity = 2.5
-    else:
+    # Skip if already at or above target resolution
+    if info["h"] >= target_h:
+        # Just enhance without upscaling
         crf = 17
-        complexity = 2.0
-
-    timeout = _estimate_timeout(info, complexity=complexity)
-
-    # 8K uses two-step upscale for better quality
-    if target_h >= 4320 and info["h"] < 2160:
-        uid = _uid()
-        mid = os.path.join(TEMP_DIR, f"{uid}_mid4k.mp4")
-        try:
-            # Step 1: upscale to 4K with enhancement
-            _run(["ffmpeg", "-y", "-i", inp,
-                  "-vf",
-                  # Denoise source
-                  "hqdn3d=2:1.5:2:1.5,"
-                  # Upscale to 4K with best-quality lanczos
-                  "scale=3840:2160:flags=lanczos+accurate_rnd+full_chroma_int"
-                  ":force_original_aspect_ratio=decrease,"
-                  "pad=3840:2160:-1:-1:color=black,"
-                  # Detail recovery sharpening
-                  "unsharp=5:5:0.8:5:5:0.0,"
-                  # Fine detail sharpening
-                  "unsharp=3:3:0.4:3:3:0.0,"
-                  # Contrast enhancement
-                  "eq=contrast=1.04:brightness=0.01:saturation=1.06",
-                  "-map", "0:v", "-map", "0:a?",
-                  *_ultra_video_args(crf=15, preset="slow"),
-                  *_hq_audio_args(), mid], timeout=timeout)
-
-            # Step 2: 4K → 8K with fine sharpening
-            _run(["ffmpeg", "-y", "-i", mid,
-                  "-vf",
-                  "scale=7680:4320:flags=lanczos+accurate_rnd+full_chroma_int"
-                  ":force_original_aspect_ratio=decrease,"
-                  "pad=7680:4320:-1:-1:color=black,"
-                  # Lighter sharpening for 8K (already detailed from 4K pass)
-                  "unsharp=5:5:0.6:5:5:0.0,"
-                  "unsharp=3:3:0.3:3:3:0.0,"
-                  "eq=contrast=1.02:saturation=1.03",
-                  "-map", "0:v", "-map", "0:a?",
-                  *_ultra_video_args(crf=crf, preset="slow"),
-                  *_hq_audio_args(), out], timeout=timeout)
-        finally:
-            if os.path.exists(mid):
-                os.remove(mid)
-    else:
-        # Single-pass upscale for 720p/1080p/1440p/4K (or 8K from 4K source)
-        # Build filter chain based on upscale ratio
-        scale_ratio = dst_pixels / max(src_pixels, 1)
-
-        # Stronger sharpening for bigger jumps
-        if scale_ratio > 4:
-            sharp1 = "unsharp=7:7:1.0:7:7:0.0"
-            sharp2 = "unsharp=3:3:0.5:3:3:0.0"
-        elif scale_ratio > 2:
-            sharp1 = "unsharp=5:5:0.9:5:5:0.0"
-            sharp2 = "unsharp=3:3:0.4:3:3:0.0"
-        else:
-            sharp1 = "unsharp=5:5:0.7:5:5:0.0"
-            sharp2 = "unsharp=3:3:0.3:3:3:0.0"
-
         vf = (
-            # Pre-upscale denoise
             "hqdn3d=2:1.5:2:1.5,"
-            # High-quality lanczos upscale
-            f"scale={tw}:{th}:flags=lanczos+accurate_rnd+full_chroma_int"
-            ":force_original_aspect_ratio=decrease,"
-            f"pad={tw}:{th}:-1:-1:color=black,"
-            # Multi-radius sharpening (detail recovery + edge enhancement)
-            f"{sharp1},"
-            f"{sharp2},"
-            # Subtle contrast & color enhancement
-            "eq=contrast=1.04:brightness=0.01:saturation=1.06"
+            "unsharp=5:5:0.6:5:5:0.0,"
+            "eq=contrast=1.03:brightness=0.01:saturation=1.05"
         )
+        timeout = _estimate_timeout(info, complexity=1.5)
         _run(["ffmpeg", "-y", "-i", inp,
               "-vf", vf,
               "-map", "0:v", "-map", "0:a?",
-              *_ultra_video_args(crf=crf, preset="slow"),
+              *_ultra_video_args(crf=crf, preset="medium"),
               *_hq_audio_args(), out], timeout=timeout)
+        return
+
+    # Determine CRF and complexity based on target
+    if target_h >= 2160:
+        crf = 17
+        complexity = 3.0
+    elif target_h >= 1440:
+        crf = 17
+        complexity = 2.5
+    else:
+        crf = 18
+        complexity = 2.0
+
+    timeout = _estimate_timeout(info, complexity=complexity)
+    scale_ratio = dst_pixels / max(src_pixels, 1)
+
+    # Adaptive sharpening — one pass only to save memory
+    if scale_ratio > 4:
+        sharp = "unsharp=5:5:0.8:5:5:0.0"
+    elif scale_ratio > 2:
+        sharp = "unsharp=5:5:0.6:5:5:0.0"
+    else:
+        sharp = "unsharp=5:5:0.5:5:5:0.0"
+
+    vf = (
+        # Light denoise before upscaling
+        "hqdn3d=2:1.5:2:1.5,"
+        # Lanczos upscale
+        f"scale={tw}:{th}:flags=lanczos"
+        ":force_original_aspect_ratio=decrease,"
+        f"pad={tw}:{th}:-1:-1:color=black,"
+        # Single-pass sharpening (saves RAM vs multi-pass)
+        f"{sharp},"
+        # Subtle enhancement
+        "eq=contrast=1.04:brightness=0.01:saturation=1.06"
+    )
+    _run(["ffmpeg", "-y", "-i", inp,
+          "-vf", vf,
+          "-map", "0:v", "-map", "0:a?",
+          *_ultra_video_args(crf=crf, preset="medium"),
+          *_hq_audio_args(), out], timeout=timeout)
 
 def do_speed(inp, out, factor):
     """Speed up with proper audio tempo scaling."""
@@ -484,7 +472,7 @@ def do_enhance(inp, out, preset):
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf", vf,
           "-map", "0:v", "-map", "0:a?",
-          *_ultra_video_args(crf=crf, preset="slow"),
+          *_ultra_video_args(crf=crf, preset="medium"),
           *_hq_audio_args(), out], timeout=timeout)
 
 def do_stabilize(inp, out, strength):
@@ -586,7 +574,7 @@ def do_social(inp, out, platform):
     _run(["ffmpeg", "-y", "-i", inp,
           "-vf", vf,
           "-r", str(fps_out),
-          *_hq_video_args(br, preset="slow"),
+          *_hq_video_args(br, preset="medium"),
           *_hq_audio_args(),
           out], timeout=timeout)
 
@@ -596,7 +584,7 @@ MODES = {
     "slomo":      {"icon": "🎬", "title": "Slow-Motion",    "prompt": "Send me a video — I'll create smooth slow motion."},
     "smooth":     {"icon": "✨", "title": "Smooth FPS",     "prompt": "Send me a video — I'll interpolate it to high frame rates."},
     "motionblur": {"icon": "💨", "title": "Motion Blur",    "prompt": "Send me a video — I'll add RSMB-style motion blur."},
-    "upscale":    {"icon": "🔍", "title": "Upscale",        "prompt": "Send me a video — I'll upscale it with multi-pass Topaz-style enhancement to 720p / 1080p / 1440p / 4K / 8K."},
+    "upscale":    {"icon": "🔍", "title": "Upscale",        "prompt": "Send me a video — I'll upscale it with enhancement to 720p / 1080p / 1440p / 4K."},
     "speed":      {"icon": "⚡", "title": "Speed Up",       "prompt": "Send me a video — I'll speed it up with frame blending."},
     "reverse":    {"icon": "⏪", "title": "Reverse",        "prompt": "Send me a video — I'll reverse it."},
     "boomerang":  {"icon": "🔁", "title": "Boomerang",      "prompt": "Send me a video — I'll make a forward + reverse loop."},
@@ -632,8 +620,6 @@ OPTION_KEYBOARDS = {
     ], [
         InlineKeyboardButton("1440p", callback_data="up_1440"),
         InlineKeyboardButton("4K", callback_data="up_2160"),
-    ], [
-        InlineKeyboardButton("8K", callback_data="up_4320"),
     ]],
     "speed": [[
         InlineKeyboardButton("1.5x", callback_data="spd_1.5"),
@@ -688,7 +674,7 @@ INSTANT_MODES = {"reverse", "boomerang", "audio"}
 WELCOME_TEXT = (
     "🎥 **Video Studio Bot**\n\n"
     "Professional video processing — no file limits, no quality loss.\n"
-    "Premium H.264 encoding with Topaz-style upscaling up to 8K.\n"
+    "Premium H.264 encoding with upscaling up to 4K.\n"
     "Optimized for Retina, OLED, and ProMotion displays.\n\n"
     "**Motion & FPS**\n"
     "/slomo — Smooth slow motion (2x, 4x, 8x)\n"
@@ -701,7 +687,7 @@ WELCOME_TEXT = (
     "/enhance — Sharpen + denoise + color (4 presets)\n"
     "/stabilize — Remove camera shake\n"
     "/denoise — Clean up noise & grain\n"
-    "/upscale — Topaz-style upscale to 720p / 1080p / 1440p / 4K / 8K\n\n"
+    "/upscale — Upscale to 720p / 1080p / 1440p / 4K\n\n"
     "**Export & Tools**\n"
     "/social — Export for IG / TikTok / YouTube / X (no recompression)\n"
     "/compress — Reduce file size\n"
