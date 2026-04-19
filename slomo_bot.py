@@ -40,10 +40,11 @@ processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 # ── Encoding Presets ────────────────────────────────────────────────────────
 
-def _hq_video_args(bitrate_mbps=12, preset="slow"):
+def _hq_video_args(bitrate_mbps=12, preset="medium"):
     """
-    Premium H.264 encoding — CRF-quality with bitrate floor.
-    Uses slower preset for better compression efficiency and detail retention.
+    Premium H.264 encoding with bitrate target.
+    Default preset=medium balances quality vs Railway CPU.
+    Use preset=slow only for upscale/enhance where it matters.
     Level 5.2 required for 4K+, tune=film for cinematic content.
     """
     return [
@@ -56,11 +57,11 @@ def _hq_video_args(bitrate_mbps=12, preset="slow"):
         "-b:v", f"{bitrate_mbps}M",
         "-maxrate", f"{int(bitrate_mbps * 1.8)}M",
         "-bufsize", f"{bitrate_mbps * 3}M",
-        "-x264-params", "aq-mode=3:aq-strength=0.8:deblock=-1,-1:ref=5:bframes=5:b-adapt=2:rc-lookahead=60:me=umh:subme=9:trellis=2",
+        "-x264-params", "aq-mode=3:aq-strength=0.8:ref=4:bframes=4:b-adapt=2:rc-lookahead=40:me=umh:subme=8:trellis=2:deblock=-1\\,-1",
         "-movflags", "+faststart",
     ]
 
-def _ultra_video_args(crf=15, preset="slower"):
+def _ultra_video_args(crf=15, preset="slow"):
     """
     Maximum quality CRF encoding for upscale/enhance operations.
     CRF mode lets x264 allocate bits where they matter most.
@@ -73,7 +74,7 @@ def _ultra_video_args(crf=15, preset="slower"):
         "-preset", preset,
         "-tune", "film",
         "-crf", str(crf),
-        "-x264-params", "aq-mode=3:aq-strength=0.7:deblock=-1,-1:ref=6:bframes=5:b-adapt=2:rc-lookahead=60:me=umh:subme=10:trellis=2",
+        "-x264-params", "aq-mode=3:aq-strength=0.7:ref=5:bframes=5:b-adapt=2:rc-lookahead=50:me=umh:subme=9:trellis=2:deblock=-1\\,-1",
         "-movflags", "+faststart",
     ]
 
@@ -121,9 +122,20 @@ def _run(cmd, timeout=600):
             "Try a shorter clip or a lighter setting."
         )
     if r.returncode != 0:
-        # Log full stderr for debugging, send last portion to user
         logger.error(f"FFmpeg stderr:\n{r.stderr}")
-        raise RuntimeError(r.stderr[-2000:])
+        # Extract the actual error lines — FFmpeg puts errors after "Error" or at the end
+        # but stream info bloats stderr. Find the meaningful part.
+        lines = r.stderr.strip().split('\n')
+        error_lines = [l for l in lines if any(k in l.lower() for k in
+                       ['error', 'invalid', 'failed', 'no such', 'unknown',
+                        'not found', 'cannot', 'killed', 'signal', 'denied',
+                        'memory', 'overflow', 'corrupt'])]
+        if error_lines:
+            err_msg = '\n'.join(error_lines[-5:])
+        else:
+            # Fallback: last few lines which usually have the error
+            err_msg = '\n'.join(lines[-5:])
+        raise RuntimeError(err_msg[:1500])
 
 def probe_fps(path):
     r = subprocess.run(
