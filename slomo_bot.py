@@ -57,7 +57,8 @@ def _hq_video_args(bitrate_mbps=12, preset="medium"):
         "-b:v", f"{bitrate_mbps}M",
         "-maxrate", f"{int(bitrate_mbps * 1.8)}M",
         "-bufsize", f"{bitrate_mbps * 3}M",
-        "-x264-params", "aq-mode=3:aq-strength=0.8:ref=4:bframes=4:b-adapt=2:rc-lookahead=40:me=umh:subme=8:trellis=2:deblock=-1\\,-1",
+        "-deblock", "-1:-1",
+        "-x264-params", "aq-mode=3:aq-strength=0.8:ref=4:bframes=4:b-adapt=2:rc-lookahead=40:me=umh:subme=8:trellis=2",
         "-movflags", "+faststart",
     ]
 
@@ -74,7 +75,8 @@ def _ultra_video_args(crf=15, preset="slow"):
         "-preset", preset,
         "-tune", "film",
         "-crf", str(crf),
-        "-x264-params", "aq-mode=3:aq-strength=0.7:ref=5:bframes=5:b-adapt=2:rc-lookahead=50:me=umh:subme=9:trellis=2:deblock=-1\\,-1",
+        "-deblock", "-1:-1",
+        "-x264-params", "aq-mode=3:aq-strength=0.7:ref=5:bframes=5:b-adapt=2:rc-lookahead=50:me=umh:subme=9:trellis=2",
         "-movflags", "+faststart",
     ]
 
